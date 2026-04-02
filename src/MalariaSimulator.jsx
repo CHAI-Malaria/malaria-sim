@@ -97,6 +97,18 @@ const BIONOMICS = {
   cure_rate: 0.85,
 };
 
+// Waning and campaign parameters
+const WANING = {
+  // Dual-AI ITN (e.g., Interceptor G2, Royal Guard)
+  itn_halflife_days: 2.5 * 365,    // insecticidal half-life (~2.5 years)
+  itn_retention_halflife: 4 * 365,  // physical retention half-life (~4 years, people discard)
+  itn_campaign_default_years: 3,    // default campaign frequency
+
+  // IRS (Actellic 300CS / pirimiphos-methyl)
+  irs_halflife_days: 6 * 30,        // ~6 months residual
+  irs_rounds_default: 1,            // default rounds per year
+};
+
 function generateLandscape(config) {
   const { seed, counts, importPrev, gravityExp, homeFrac, mapW, mapH, borderThresh, extTimeBase } = config;
   const rng = new PRNG(seed);
@@ -273,7 +285,7 @@ function generateLandscape(config) {
 // ODE SOLVER (faithful port of simulator_fast.py)
 // ============================================================================
 
-function buildODE(landscape, interventions) {
+function buildODE(landscape, interventions, strategyConfig) {
   const { patches, Theta, K, nInt, nTotal } = landscape;
   const n = nTotal;
   const ni = nInt;
@@ -282,7 +294,7 @@ function buildODE(landscape, interventions) {
   const CURE_CARE_BONUS = 0.5;
   const ACUTE_DAYS = 14;
 
-  // Per-patch arrays
+  // Per-patch arrays (time-independent)
   const H = new Float64Array(n);
   const emergence = new Float64Array(n);
   const f0 = new Float64Array(n);
@@ -292,9 +304,6 @@ function buildODE(landscape, interventions) {
   const b = new Float64Array(n);
   const r = new Float64Array(n);
   const c = new Float64Array(n);
-  const f_eff = new Float64Array(n);
-  const g_eff = new Float64Array(n);
-  const sigma = new Float64Array(n);
   const cm = new Float64Array(n);
 
   for (let i = 0; i < n; i++) {
@@ -305,9 +314,9 @@ function buildODE(landscape, interventions) {
     b[i] = bio.b; r[i] = bio.r; c[i] = bio.c;
   }
 
-  // Apply interventions: build per-patch coverage
-  const itnCov = new Float64Array(n);
-  const irsCov = new Float64Array(n);
+  // Per-patch intervention config (nominal coverage, CHW, cure)
+  const itnCovNom = new Float64Array(n);   // nominal ITN coverage (at campaign time)
+  const irsCovNom = new Float64Array(n);   // nominal IRS coverage (at spray time)
   const hasChw = new Uint8Array(n);
   const cureRate = new Float64Array(n);
   for (let i = 0; i < n; i++) cureRate[i] = bio.cure_rate;
@@ -315,29 +324,54 @@ function buildODE(landscape, interventions) {
   if (interventions) {
     for (const iv of interventions) {
       for (const pi of iv.patchIndices) {
-        itnCov[pi] = Math.max(itnCov[pi], iv.itnCov || 0);
-        irsCov[pi] = Math.max(irsCov[pi], iv.irsCov || 0);
+        itnCovNom[pi] = Math.max(itnCovNom[pi], iv.itnCov || 0);
+        irsCovNom[pi] = Math.max(irsCovNom[pi], iv.irsCov || 0);
         if (iv.chw) hasChw[pi] = 1;
         if (iv.improvedCure > 0) cureRate[pi] = Math.max(cureRate[pi], iv.improvedCure);
       }
     }
   }
 
-  // Compute effective bionomic params (ITN + IRS with phi correction)
-  for (let i = 0; i < n; i++) {
-    const cI = itnCov[i], cR = irsCov[i];
-    const rr = bio.itn_rr, ss = bio.itn_ss, dd = 1 - rr - ss;
-    const phi = bio.phi;
-    const wk = bio.irs_wk;
-    const pFeed = (1 - cI) + cI * (phi * ss + (1 - phi));
-    const pKillItn = cI * phi * dd;
-    const pKillIrs = pFeed * cR * wk;
-    f_eff[i] = f0[i] * pFeed;
-    g_eff[i] = g0[i] + f0[i] * (pKillItn + pKillIrs);
-    sigma[i] = 0.5 * g_eff[i];
+  // Campaign timing config (strategy-level, shared across patches)
+  const cfg = strategyConfig || {};
+  const itnStartDay = (cfg.itnStartYear || 0) * 365;
+  const itnCycleYears = cfg.itnCycleYears || WANING.itn_campaign_default_years;
+  const itnCycleDays = itnCycleYears * 365;
+  const itnHalflife = WANING.itn_halflife_days;
+  const itnRetHalflife = WANING.itn_retention_halflife;
+  const itnDecay = Math.log(2) / itnHalflife;
+  const itnRetDecay = Math.log(2) / itnRetHalflife;
+
+  const irsStartDay = (cfg.irsStartYear || 0) * 365;
+  const irsRoundsPerYear = cfg.irsRoundsPerYear || WANING.irs_rounds_default;
+  const irsCycleDays = 365 / irsRoundsPerYear;
+  const irsHalflife = WANING.irs_halflife_days;
+  const irsDecay = Math.log(2) / irsHalflife;
+
+  // Function to compute effective ITN coverage at time t for a patch
+  // After each campaign, efficacy decays exponentially; retention also decays
+  function itnEffectiveAtTime(t, nomCov) {
+    if (nomCov <= 0 || t < itnStartDay) return 0;
+    const timeSinceStart = t - itnStartDay;
+    // Time since most recent campaign
+    const timeSinceCampaign = timeSinceStart % itnCycleDays;
+    // Insecticidal efficacy decay
+    const efficacy = Math.exp(-itnDecay * timeSinceCampaign);
+    // Physical retention decay (people discarding nets)
+    const retention = Math.exp(-itnRetDecay * timeSinceCampaign);
+    return nomCov * efficacy * retention;
   }
 
-  // Case management rate from cascade
+  // Function to compute effective IRS coverage at time t
+  function irsEffectiveAtTime(t, nomCov) {
+    if (nomCov <= 0 || t < irsStartDay) return 0;
+    const timeSinceStart = t - irsStartDay;
+    const timeSinceSpray = timeSinceStart % irsCycleDays;
+    const efficacy = Math.exp(-irsDecay * timeSinceSpray);
+    return nomCov * efficacy;
+  }
+
+  // Case management rate (time-independent, computed once)
   for (let i = 0; i < ni; i++) {
     const p = patches[i];
     let effAccess = p.access;
@@ -349,7 +383,7 @@ function buildODE(landscape, interventions) {
     cm[i] = probTreated / ACUTE_DAYS;
   }
 
-  // Host availability W = Theta @ H
+  // Host availability W = Theta @ H (time-independent)
   const W = matVecMul(Theta, H);
 
   // Incubation rates & effective recovery
@@ -360,7 +394,7 @@ function buildODE(landscape, interventions) {
     rEff[i] = r[i] + cm[i];
   }
 
-  // External patch pre-computation
+  // External patch pre-computation (use baseline f0/g0 for external)
   const extM = new Float64Array(n), extY = new Float64Array(n);
   const extZ = new Float64Array(n), extI = new Float64Array(n);
   for (let i = ni; i < n; i++) {
@@ -368,18 +402,19 @@ function buildODE(landscape, interventions) {
     extI[i] = prev * H[i];
     if (prev > 0 && prev < 1) {
       const eirEq = r[i] * prev / (b[i] * (1 - prev));
-      extZ[i] = eirEq * H[i] / (f_eff[i] * q[i]);
+      extZ[i] = eirEq * H[i] / (f0[i] * q[i]);
       extM[i] = extZ[i] / 0.05;
       extY[i] = 0.15 * extM[i];
     }
   }
 
-  // Build RHS function
+  // Pre-allocate working arrays for the RHS
   const Mall = new Float64Array(n), Yall = new Float64Array(n);
   const Zall = new Float64Array(n), Iall = new Float64Array(n);
+  const f_eff = new Float64Array(n), g_eff = new Float64Array(n), sigma_arr = new Float64Array(n);
 
-  function rhs(state, derivs) {
-    // Unpack
+  function rhs(t, state, derivs) {
+    // Unpack external state
     for (let i = 0; i < n; i++) { Mall[i] = extM[i]; Yall[i] = extY[i]; Zall[i] = extZ[i]; Iall[i] = extI[i]; }
     for (let idx = 0; idx < ni; idx++) {
       Mall[idx] = Math.max(state[idx * 4], 0);
@@ -388,10 +423,25 @@ function buildODE(landscape, interventions) {
       Iall[idx] = Math.max(state[idx * 4 + 3], 0);
     }
 
+    // Compute time-varying effective bionomic params per patch
+    for (let i = 0; i < n; i++) {
+      const cI = itnEffectiveAtTime(t, itnCovNom[i]);
+      const cR = irsEffectiveAtTime(t, irsCovNom[i]);
+      const rr = bio.itn_rr, ss = bio.itn_ss, dd = 1 - rr - ss;
+      const phi = bio.phi;
+      const wk = bio.irs_wk;
+      const pFeed = (1 - cI) + cI * (phi * ss + (1 - phi));
+      const pKillItn = cI * phi * dd;
+      const pKillIrs = pFeed * cR * wk;
+      f_eff[i] = f0[i] * pFeed;
+      g_eff[i] = g0[i] + f0[i] * (pKillItn + pKillIrs);
+      sigma_arr[i] = 0.5 * g_eff[i];
+    }
+
     // kappa = (Theta @ (c * I)) / W
-    const cI = new Float64Array(n);
-    for (let i = 0; i < n; i++) cI[i] = c[i] * Iall[i];
-    const kappa = matVecMul(Theta, cI);
+    const cI_arr = new Float64Array(n);
+    for (let i = 0; i < n; i++) cI_arr[i] = c[i] * Iall[i];
+    const kappa = matVecMul(Theta, cI_arr);
     for (let i = 0; i < n; i++) kappa[i] = W[i] > 0 ? kappa[i] / W[i] : 0;
 
     // EIR = f_eff * q * Z / W
@@ -404,7 +454,7 @@ function buildODE(landscape, interventions) {
 
     // Dispersal immigration
     const sigM = new Float64Array(n), sigY = new Float64Array(n), sigZ = new Float64Array(n);
-    for (let i = 0; i < n; i++) { sigM[i] = sigma[i] * Mall[i]; sigY[i] = sigma[i] * Yall[i]; sigZ[i] = sigma[i] * Zall[i]; }
+    for (let i = 0; i < n; i++) { sigM[i] = sigma_arr[i] * Mall[i]; sigY[i] = sigma_arr[i] * Yall[i]; sigZ[i] = sigma_arr[i] * Zall[i]; }
     const immM = matVecMul(K, sigM), immY = matVecMul(K, sigY), immZ = matVecMul(K, sigZ);
 
     // Derivatives for internal patches
@@ -415,9 +465,9 @@ function buildODE(landscape, interventions) {
       const newInf = f_eff[idx] * q[idx] * kappa[idx] * susceptMosq;
       const becomeInf = incub[idx] * Yi;
 
-      derivs[idx * 4] = emergence[idx] + immM[idx] - g_eff[idx] * Mi - sigma[idx] * Mi;
-      derivs[idx * 4 + 1] = newInf + immY[idx] - g_eff[idx] * Yi - sigma[idx] * Yi - becomeInf;
-      derivs[idx * 4 + 2] = becomeInf + immZ[idx] - g_eff[idx] * Zi - sigma[idx] * Zi;
+      derivs[idx * 4] = emergence[idx] + immM[idx] - g_eff[idx] * Mi - sigma_arr[idx] * Mi;
+      derivs[idx * 4 + 1] = newInf + immY[idx] - g_eff[idx] * Yi - sigma_arr[idx] * Yi - becomeInf;
+      derivs[idx * 4 + 2] = becomeInf + immZ[idx] - g_eff[idx] * Zi - sigma_arr[idx] * Zi;
       derivs[idx * 4 + 3] = FOI[idx] * (Hi - Ii) - rEff[idx] * Ii;
     }
   }
@@ -436,21 +486,21 @@ function solveODE(rhsFn, y0, tEnd, dt = 2.0) {
   const k1 = new Float64Array(n), k2 = new Float64Array(n), k3 = new Float64Array(n);
   const k4 = new Float64Array(n), tmp = new Float64Array(n), derivs = new Float64Array(n);
 
-  // Classic RK4 with fixed step for simplicity and speed
+  // Classic RK4 with fixed step — RHS is time-aware: rhs(t, state, derivs)
   while (t < tEnd) {
     const h = Math.min(dt, tEnd - t);
 
     // k1
-    rhsFn(y, k1);
+    rhsFn(t, y, k1);
     // k2
     for (let i = 0; i < n; i++) tmp[i] = y[i] + 0.5 * h * k1[i];
-    rhsFn(tmp, k2);
+    rhsFn(t + 0.5 * h, tmp, k2);
     // k3
     for (let i = 0; i < n; i++) tmp[i] = y[i] + 0.5 * h * k2[i];
-    rhsFn(tmp, k3);
+    rhsFn(t + 0.5 * h, tmp, k3);
     // k4
     for (let i = 0; i < n; i++) tmp[i] = y[i] + h * k3[i];
-    rhsFn(tmp, k4);
+    rhsFn(t + h, tmp, k4);
     // Update
     for (let i = 0; i < n; i++) {
       y[i] += (h / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
@@ -470,8 +520,8 @@ function solveODE(rhsFn, y0, tEnd, dt = 2.0) {
   return snapshots;
 }
 
-function runSimulation(landscape, interventions, tMaxDays, initPrevByPatch) {
-  const ode = buildODE(landscape, interventions);
+function runSimulation(landscape, interventions, tMaxDays, initPrevByPatch, strategyConfig) {
+  const ode = buildODE(landscape, interventions, strategyConfig);
   const ni = ode.ni;
   const nStates = ni * 4;
 
@@ -727,47 +777,99 @@ const STRATEGY_NAMES = ["Strategy A", "Strategy B", "Strategy C"];
 // UI COMPONENTS
 // ============================================================================
 
-function LandscapeMap({ landscape, selectedPatch, onSelectPatch, strategyPerPatch, width = 380, height = 320 }) {
+function prevColorScale(prev) {
+  // Green (low) → Yellow → Orange → Red (high) prevalence color scale
+  // Input: prevalence 0-1, Output: hex color string
+  const v = Math.max(0, Math.min(1, prev));
+  // 0% → #2d8a4e (green), 20% → #a8c044, 40% → #f0c808 (yellow), 60% → #e8781a, 80%+ → #c22a2a (red)
+  const stops = [
+    [0.00, [45, 138, 78]],
+    [0.15, [120, 180, 60]],
+    [0.30, [200, 200, 40]],
+    [0.45, [240, 180, 20]],
+    [0.60, [232, 120, 26]],
+    [0.80, [194, 42, 42]],
+    [1.00, [140, 20, 20]],
+  ];
+  let lo = stops[0], hi = stops[stops.length - 1];
+  for (let s = 0; s < stops.length - 1; s++) {
+    if (v >= stops[s][0] && v <= stops[s + 1][0]) { lo = stops[s]; hi = stops[s + 1]; break; }
+  }
+  const t = hi[0] === lo[0] ? 0 : (v - lo[0]) / (hi[0] - lo[0]);
+  const r = Math.round(lo[1][0] + t * (hi[1][0] - lo[1][0]));
+  const g = Math.round(lo[1][1] + t * (hi[1][1] - lo[1][1]));
+  const b = Math.round(lo[1][2] + t * (hi[1][2] - lo[1][2]));
+  return `rgb(${r},${g},${b})`;
+}
+
+function LandscapeMap({ landscape, selectedPatch, onSelectPatch, strategyPerPatch,
+  prevalenceValues, colorMode = "archetype", title, width = 380, height = 320, compact = false }) {
   if (!landscape) return null;
   const { patches, nInt, config: cfg } = landscape;
   const mapW = cfg.mapW, mapH = cfg.mapH;
   const scaleX = (width - 40) / mapW;
-  const scaleY = (height - 50) / mapH;
+  const scaleY = (height - (compact ? 35 : 50)) / mapH;
   const scale = Math.min(scaleX, scaleY);
-  const ox = 20, oy = height - 25;
+  const ox = 20, oy = height - (compact ? 15 : 25);
 
   const maxPop = Math.max(...patches.slice(0, nInt).map(p => p.population));
+  const usePrevColor = colorMode === "prevalence" && prevalenceValues;
 
   return (
     <svg width={width} height={height} style={{ display: "block" }}>
+      {/* Title */}
+      {title && <text x={width / 2} y={14} textAnchor="middle" fill="var(--text, #e8e6e3)" fontSize={11} fontWeight={700}>{title}</text>}
       {/* Border zone */}
       <rect x={ox} y={oy - cfg.borderThresh * mapH * scale} width={mapW * scale}
         height={cfg.borderThresh * mapH * scale}
         fill="var(--border-zone, #f5e6d3)" opacity={0.3} rx={3} />
-      <text x={ox + mapW * scale / 2} y={oy - 4} textAnchor="middle"
-        fill="var(--text-dim, #999)" fontSize={9} fontStyle="italic">External border zone</text>
+      {!compact && <text x={ox + mapW * scale / 2} y={oy - 4} textAnchor="middle"
+        fill="var(--text-dim, #999)" fontSize={9} fontStyle="italic">External border zone</text>}
       {/* Patches */}
       {patches.slice(0, nInt).map((p, i) => {
         const cx = ox + p.x * scale;
         const cy = oy - p.y * scale;
-        const r = 6 + 14 * Math.sqrt(p.population / maxPop);
+        const r = compact ? (4 + 10 * Math.sqrt(p.population / maxPop)) : (6 + 14 * Math.sqrt(p.population / maxPop));
         const isSelected = selectedPatch === i;
         const spp = strategyPerPatch ? strategyPerPatch[i] : null;
         const hasIntervention = spp && (spp.itnCov > 0 || spp.irsCov > 0 || spp.chw || spp.improvedCure > 0);
+
+        let fillColor = p.color;
+        if (usePrevColor) {
+          fillColor = prevColorScale(prevalenceValues[i]);
+        }
+
         return (
-          <g key={i} onClick={() => onSelectPatch && onSelectPatch(i)} style={{ cursor: "pointer" }}>
-            {hasIntervention && <circle cx={cx} cy={cy} r={r + 4} fill="none" stroke="#000" strokeWidth={2} strokeDasharray="3,2" />}
-            <circle cx={cx} cy={cy} r={r} fill={p.color}
+          <g key={i} onClick={() => onSelectPatch && onSelectPatch(i)} style={{ cursor: onSelectPatch ? "pointer" : "default" }}>
+            {hasIntervention && !compact && <circle cx={cx} cy={cy} r={r + 4} fill="none" stroke="#000" strokeWidth={2} strokeDasharray="3,2" />}
+            <circle cx={cx} cy={cy} r={r} fill={fillColor}
               stroke={isSelected ? "#000" : p.isBorder ? "#555" : "#fff"}
               strokeWidth={isSelected ? 3 : p.isBorder ? 2 : 1}
-              opacity={hasIntervention === false && strategyPerPatch ? 0.35 : 0.85} />
-            <text x={cx} y={cy + r + 11} textAnchor="middle" fontSize={7.5}
+              opacity={hasIntervention === false && strategyPerPatch && !usePrevColor ? 0.35 : 0.85} />
+            {/* Prevalence label on patch */}
+            {usePrevColor && <text x={cx} y={cy + 3} textAnchor="middle" fontSize={compact ? 6.5 : 8}
+              fill="#fff" fontWeight={700} style={{ pointerEvents: "none", textShadow: "0 0 3px rgba(0,0,0,0.8)" }}>
+              {(prevalenceValues[i] * 100).toFixed(0)}%
+            </text>}
+            {!compact && <text x={cx} y={cy + r + 11} textAnchor="middle" fontSize={7.5}
               fill="var(--text-main, #333)" fontWeight={isSelected ? 700 : 400}>
               {p.name.replace("Settlement ", "S").replace("Village ", "V").replace("Town ", "T")}
-            </text>
+            </text>}
           </g>
         );
       })}
+      {/* Color scale legend for prevalence mode */}
+      {usePrevColor && (
+        <g>
+          {[0, 0.2, 0.4, 0.6, 0.8].map((v, i) => (
+            <g key={v}>
+              <rect x={ox + i * 28} y={compact ? height - 12 : 4} width={28} height={8} fill={prevColorScale(v)} rx={1} />
+              <text x={ox + i * 28 + 14} y={compact ? height - 1 : 20} textAnchor="middle"
+                fontSize={7} fill="var(--text-dim, #999)">{(v * 100).toFixed(0)}%</text>
+            </g>
+          ))}
+        </g>
+      )}
     </svg>
   );
 }
@@ -840,8 +942,8 @@ export default function MalariaSimulator() {
 
   // Strategies (up to 3)
   const [strategies, setStrategies] = useState([
-    { template: "none", perPatch: null, label: "Baseline" },
-    { template: "itn_universal", perPatch: null, label: "Universal ITN" },
+    { template: "none", perPatch: null, label: "Baseline", config: { itnStartYear: 0, itnCycleYears: 3, irsStartYear: 0, irsRoundsPerYear: 1 } },
+    { template: "itn_universal", perPatch: null, label: "Universal ITN", config: { itnStartYear: 0, itnCycleYears: 3, irsStartYear: 0, irsRoundsPerYear: 1 } },
   ]);
 
   // Results
@@ -854,6 +956,7 @@ export default function MalariaSimulator() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeTab, setActiveTab] = useState("landscape"); // landscape | strategies | results
   const [showAddModal, setShowAddModal] = useState(false);
+  const [mapColorMode, setMapColorMode] = useState("archetype"); // "archetype" | "prevalence"
 
   const totalPatches = Object.values(counts).reduce((a, b) => a + b, 0);
 
@@ -872,7 +975,7 @@ export default function MalariaSimulator() {
     // Reset strategy per-patch overrides
     setStrategies(prev => prev.map(s => {
       const ivs = makeTemplateInterventions(s.template, ls);
-      return { ...s, perPatch: mergeInterventions(ivs, ls.nInt) };
+      return { ...s, perPatch: mergeInterventions(ivs, ls.nInt), config: s.config || { itnStartYear: 0, itnCycleYears: 3, irsStartYear: 0, irsRoundsPerYear: 1 } };
     }));
     setActiveTab("strategies");
   }, [seed, counts, importPrev, targetPrev]);
@@ -884,7 +987,7 @@ export default function MalariaSimulator() {
       const next = [...prev];
       const ivs = makeTemplateInterventions(templateKey, landscape);
       const label = TEMPLATES.find(t => t.key === templateKey)?.label || templateKey;
-      next[idx] = { template: templateKey, perPatch: mergeInterventions(ivs, landscape.nInt), label };
+      next[idx] = { ...next[idx], template: templateKey, perPatch: mergeInterventions(ivs, landscape.nInt), label };
       return next;
     });
     setResults(null);
@@ -904,8 +1007,11 @@ export default function MalariaSimulator() {
     if (strategies.length >= 3 || !landscape) return;
     const tmpl = TEMPLATES.find(t => t.key === templateKey) || TEMPLATES[0];
     const ivs = makeTemplateInterventions(templateKey, landscape);
-    setStrategies(prev => [...prev, { template: templateKey, perPatch: mergeInterventions(ivs, landscape.nInt), label: tmpl.label }]);
-    setActiveStrategy(strategies.length); // select the new one
+    setStrategies(prev => [...prev, {
+      template: templateKey, perPatch: mergeInterventions(ivs, landscape.nInt), label: tmpl.label,
+      config: { itnStartYear: 0, itnCycleYears: 3, irsStartYear: 0, irsRoundsPerYear: 1 },
+    }]);
+    setActiveStrategy(strategies.length);
     setShowAddModal(false);
     setResults(null);
   };
@@ -934,7 +1040,7 @@ export default function MalariaSimulator() {
       const tMax = tMaxYears * 365;
       const allResults = strategies.map(s => {
         const ivs = perPatchToInterventions(s.perPatch || []);
-        const simRes = runSimulation(landscape, ivs, tMax, initPrevByPatch);
+        const simRes = runSimulation(landscape, ivs, tMax, initPrevByPatch, s.config);
         const costs = computeCosts(landscape, ivs);
         return { ...simRes, costs, label: s.label };
       });
@@ -1182,6 +1288,66 @@ export default function MalariaSimulator() {
                   </select>
                 </div>
 
+                {/* Campaign timing controls */}
+                <div style={{ marginBottom: 12, padding: 10, background: "var(--bg3)", borderRadius: 6, border: "1px solid var(--border)" }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-dim)", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                    Campaign Timing
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 16px", fontSize: 12 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: "var(--text-dim)", minWidth: 90 }}>ITN start year</span>
+                      <select value={strategies[activeStrategy]?.config?.itnStartYear ?? 0}
+                        onChange={e => {
+                          const val = +e.target.value;
+                          setStrategies(prev => { const next = [...prev]; next[activeStrategy] = { ...next[activeStrategy], config: { ...next[activeStrategy].config, itnStartYear: val } }; return next; });
+                          setResults(null);
+                        }}
+                        style={{ flex: 1, padding: "3px 6px", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 4, color: "var(--text)", fontSize: 11 }}>
+                        {[0, 1, 2, 3, 4, 5].map(y => <option key={y} value={y}>Year {y}</option>)}
+                      </select>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: "var(--text-dim)", minWidth: 90 }}>ITN cycle</span>
+                      <select value={strategies[activeStrategy]?.config?.itnCycleYears ?? 3}
+                        onChange={e => {
+                          const val = +e.target.value;
+                          setStrategies(prev => { const next = [...prev]; next[activeStrategy] = { ...next[activeStrategy], config: { ...next[activeStrategy].config, itnCycleYears: val } }; return next; });
+                          setResults(null);
+                        }}
+                        style={{ flex: 1, padding: "3px 6px", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 4, color: "var(--text)", fontSize: 11 }}>
+                        {[2, 3, 4, 5].map(y => <option key={y} value={y}>Every {y} years</option>)}
+                      </select>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: "var(--text-dim)", minWidth: 90 }}>IRS start year</span>
+                      <select value={strategies[activeStrategy]?.config?.irsStartYear ?? 0}
+                        onChange={e => {
+                          const val = +e.target.value;
+                          setStrategies(prev => { const next = [...prev]; next[activeStrategy] = { ...next[activeStrategy], config: { ...next[activeStrategy].config, irsStartYear: val } }; return next; });
+                          setResults(null);
+                        }}
+                        style={{ flex: 1, padding: "3px 6px", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 4, color: "var(--text)", fontSize: 11 }}>
+                        {[0, 1, 2, 3, 4, 5].map(y => <option key={y} value={y}>Year {y}</option>)}
+                      </select>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: "var(--text-dim)", minWidth: 90 }}>IRS rounds/yr</span>
+                      <select value={strategies[activeStrategy]?.config?.irsRoundsPerYear ?? 1}
+                        onChange={e => {
+                          const val = +e.target.value;
+                          setStrategies(prev => { const next = [...prev]; next[activeStrategy] = { ...next[activeStrategy], config: { ...next[activeStrategy].config, irsRoundsPerYear: val } }; return next; });
+                          setResults(null);
+                        }}
+                        style={{ flex: 1, padding: "3px 6px", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 4, color: "var(--text)", fontSize: 11 }}>
+                        {[1, 2].map(r => <option key={r} value={r}>{r} round{r > 1 ? "s" : ""}/year</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 6 }}>
+                    ITN efficacy decays between campaigns (half-life ~2.5 yr). IRS wanes faster (~6 mo half-life).
+                  </div>
+                </div>
+
                 <div style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 4 }}>
                   Click a patch on the map to edit its interventions, or use the table below.
                 </div>
@@ -1293,19 +1459,33 @@ export default function MalariaSimulator() {
             {/* Map */}
             <div style={{ flex: "0 0 auto" }}>
               <div style={{ background: "var(--bg2)", border: "1px solid var(--border)", borderRadius: 10, padding: 12 }}>
-                <div style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 6, fontWeight: 600 }}>
-                  <span style={{ color: STRATEGY_COLORS[activeStrategy] }}>{strategies[activeStrategy]?.label}</span> — Spatial View
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                  <div style={{ fontSize: 12, color: "var(--text-dim)", fontWeight: 600 }}>
+                    <span style={{ color: STRATEGY_COLORS[activeStrategy] }}>{strategies[activeStrategy]?.label}</span> — Spatial View
+                  </div>
+                  <div style={{ display: "flex", gap: 2, background: "var(--bg3)", borderRadius: 5, padding: 1 }}>
+                    {[["archetype", "Type"], ["prevalence", "Prevalence"]].map(([mode, label]) => (
+                      <button key={mode} onClick={() => setMapColorMode(mode)}
+                        style={{
+                          padding: "3px 8px", fontSize: 10, fontWeight: 600, borderRadius: 4,
+                          border: "none", cursor: "pointer",
+                          background: mapColorMode === mode ? "var(--accent)" : "transparent",
+                          color: mapColorMode === mode ? "#000" : "var(--text-dim)",
+                        }}>{label}</button>
+                    ))}
+                  </div>
                 </div>
                 <LandscapeMap landscape={landscape} selectedPatch={selectedPatch}
                   onSelectPatch={setSelectedPatch}
                   strategyPerPatch={strategies[activeStrategy]?.perPatch}
+                  prevalenceValues={initPrevByPatch}
+                  colorMode={mapColorMode}
                   width={360} height={300} />
                 {selectedPatch !== null && strategies[activeStrategy]?.perPatch && (
                   <PatchEditor patch={landscape.patches[selectedPatch]} patchIdx={selectedPatch}
                     perPatch={strategies[activeStrategy].perPatch}
                     onChange={pp => setPerPatch(activeStrategy, pp)} />
-                )}
-              </div>
+                )}              </div>
             </div>
           </div>
         </div>
@@ -1459,6 +1639,48 @@ export default function MalariaSimulator() {
                       })}
                     </tbody>
                   </table>
+                </div>
+              </div>
+
+              {/* Before / After prevalence maps */}
+              <div style={{ background: "var(--bg2)", border: "1px solid var(--border)", borderRadius: 10, padding: 16, marginTop: 16 }}>
+                <h3 style={{ margin: "0 0 12px", fontSize: 14, fontWeight: 700 }}>Spatial Prevalence: Before → After</h3>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", overflowX: "auto" }}>
+                  {/* Starting prevalence map */}
+                  <div style={{ flex: "0 0 auto" }}>
+                    <LandscapeMap landscape={landscape}
+                      prevalenceValues={initPrevByPatch}
+                      colorMode="prevalence"
+                      title="Starting"
+                      width={220} height={200} compact />
+                  </div>
+                  {/* Final prevalence for each strategy */}
+                  {results.map((r, idx) => {
+                    const finalPrevs = [];
+                    for (let i = 0; i < landscape.nInt; i++) {
+                      finalPrevs.push(r.prevByPatch[i][r.prevByPatch[i].length - 1]);
+                    }
+                    return (
+                      <div key={idx} style={{ flex: "0 0 auto" }}>
+                        <LandscapeMap landscape={landscape}
+                          prevalenceValues={finalPrevs}
+                          colorMode="prevalence"
+                          title={r.label}
+                          width={220} height={200} compact />
+                      </div>
+                    );
+                  })}
+                </div>
+                {/* Shared legend */}
+                <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 8, fontSize: 10, color: "var(--text-dim)" }}>
+                  <span>Prevalence:</span>
+                  <div style={{ display: "flex", gap: 0 }}>
+                    {[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8].map(v => (
+                      <div key={v} style={{ width: 24, height: 10, background: prevColorScale(v) }} />
+                    ))}
+                  </div>
+                  <span>0%</span>
+                  <span style={{ marginLeft: -8 }}>→ 80%+</span>
                 </div>
               </div>
             </div>
