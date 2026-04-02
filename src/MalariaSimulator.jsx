@@ -95,6 +95,10 @@ const BIONOMICS = {
   mu: 0.1, f: 1 / 3, q: 0.9, eip: 10, eggs: 30, b: 0.55, r: 1 / 200, c: 0.05,
   itn_rr: 0.56, itn_ss: 0.03, phi: 0.85, irs_wk: 0.60, irs_rr: 0.05,
   cure_rate: 0.85,
+  // Immunity parameters (SIRS extension)
+  alpha: 0.38,        // susceptibility reduction in immune individuals (0 = fully immune, 1 = no effect)
+  omega: 1 / 540,     // immunity waning rate (~1.5 years without boosting)
+  c_imm_factor: 0.3,  // infectiousness reduction for immune individuals who are reinfected
 };
 
 // Waning and campaign parameters
@@ -411,16 +415,35 @@ function buildODE(landscape, interventions, strategyConfig) {
   // Pre-allocate working arrays for the RHS
   const Mall = new Float64Array(n), Yall = new Float64Array(n);
   const Zall = new Float64Array(n), Iall = new Float64Array(n);
+  const Rall = new Float64Array(n);  // immune/semi-immune pool
   const f_eff = new Float64Array(n), g_eff = new Float64Array(n), sigma_arr = new Float64Array(n);
+
+  // Immunity parameters
+  const alpha = bio.alpha;         // susceptibility reduction in immune individuals
+  const omega = bio.omega;         // immunity waning rate
+  const c_imm_factor = bio.c_imm_factor; // infectiousness reduction for immune reinfections
+
+  // External patch: estimate immune pool from prevalence
+  // At high endemic equilibrium, roughly (1 - prev) * 0.5 of the population is immune
+  const extR = new Float64Array(n);
+  for (let i = ni; i < n; i++) {
+    const prev = patches[i].extPrev || 0;
+    // In a high-transmission area, many recovered people have immunity
+    extR[i] = prev > 0 ? (1 - prev) * 0.6 * H[i] : 0;
+  }
+
+  // nStates is now 5 per internal patch
+  const nStates = ni * 5;
 
   function rhs(t, state, derivs) {
     // Unpack external state
-    for (let i = 0; i < n; i++) { Mall[i] = extM[i]; Yall[i] = extY[i]; Zall[i] = extZ[i]; Iall[i] = extI[i]; }
+    for (let i = 0; i < n; i++) { Mall[i] = extM[i]; Yall[i] = extY[i]; Zall[i] = extZ[i]; Iall[i] = extI[i]; Rall[i] = extR[i]; }
     for (let idx = 0; idx < ni; idx++) {
-      Mall[idx] = Math.max(state[idx * 4], 0);
-      Yall[idx] = Math.max(state[idx * 4 + 1], 0);
-      Zall[idx] = Math.max(state[idx * 4 + 2], 0);
-      Iall[idx] = Math.max(state[idx * 4 + 3], 0);
+      Mall[idx] = Math.max(state[idx * 5], 0);
+      Yall[idx] = Math.max(state[idx * 5 + 1], 0);
+      Zall[idx] = Math.max(state[idx * 5 + 2], 0);
+      Iall[idx] = Math.max(state[idx * 5 + 3], 0);
+      Rall[idx] = Math.max(state[idx * 5 + 4], 0);
     }
 
     // Compute time-varying effective bionomic params per patch
@@ -438,9 +461,21 @@ function buildODE(landscape, interventions, strategyConfig) {
       sigma_arr[i] = 0.5 * g_eff[i];
     }
 
-    // kappa = (Theta @ (c * I)) / W
+    // Kappa: net infectiousness of humans in each patch
+    // Infected individuals from the immune pool are less infectious (c_imm_factor)
+    // Approximate: effective_c = c * (1 - immune_fraction_of_infected * (1 - c_imm_factor))
+    // Since we don't track I_naive vs I_immune separately, use R/(R+S) as proxy for
+    // what fraction of new infections come from immune individuals
     const cI_arr = new Float64Array(n);
-    for (let i = 0; i < n; i++) cI_arr[i] = c[i] * Iall[i];
+    for (let i = 0; i < n; i++) {
+      const Hi = H[i];
+      const Ri = Rall[i];
+      const Si = Math.max(Hi - Iall[i] - Ri, 0);
+      // Fraction of current infected pool that came from immune reinfections
+      const immuneFrac = (Si + Ri) > 0 ? (alpha * Ri) / (Si + alpha * Ri) : 0;
+      const effectiveC = c[i] * (1 - immuneFrac * (1 - c_imm_factor));
+      cI_arr[i] = effectiveC * Iall[i];
+    }
     const kappa = matVecMul(Theta, cI_arr);
     for (let i = 0; i < n; i++) kappa[i] = W[i] > 0 ? kappa[i] / W[i] : 0;
 
@@ -457,22 +492,34 @@ function buildODE(landscape, interventions, strategyConfig) {
     for (let i = 0; i < n; i++) { sigM[i] = sigma_arr[i] * Mall[i]; sigY[i] = sigma_arr[i] * Yall[i]; sigZ[i] = sigma_arr[i] * Zall[i]; }
     const immM = matVecMul(K, sigM), immY = matVecMul(K, sigY), immZ = matVecMul(K, sigZ);
 
-    // Derivatives for internal patches
+    // Derivatives for internal patches (SIRS model)
     for (let idx = 0; idx < ni; idx++) {
-      const Mi = Mall[idx], Yi = Yall[idx], Zi = Zall[idx], Ii = Iall[idx];
+      const Mi = Mall[idx], Yi = Yall[idx], Zi = Zall[idx], Ii = Iall[idx], Ri = Rall[idx];
       const Hi = H[idx];
+      const Si = Math.max(Hi - Ii - Ri, 0);  // Susceptible = total - infected - immune
+
+      // Mosquito dynamics (unchanged)
       const susceptMosq = Math.max(Mi - Yi - Zi, 0);
       const newInf = f_eff[idx] * q[idx] * kappa[idx] * susceptMosq;
       const becomeInf = incub[idx] * Yi;
 
-      derivs[idx * 4] = emergence[idx] + immM[idx] - g_eff[idx] * Mi - sigma_arr[idx] * Mi;
-      derivs[idx * 4 + 1] = newInf + immY[idx] - g_eff[idx] * Yi - sigma_arr[idx] * Yi - becomeInf;
-      derivs[idx * 4 + 2] = becomeInf + immZ[idx] - g_eff[idx] * Zi - sigma_arr[idx] * Zi;
-      derivs[idx * 4 + 3] = FOI[idx] * (Hi - Ii) - rEff[idx] * Ii;
+      derivs[idx * 5] = emergence[idx] + immM[idx] - g_eff[idx] * Mi - sigma_arr[idx] * Mi;
+      derivs[idx * 5 + 1] = newInf + immY[idx] - g_eff[idx] * Yi - sigma_arr[idx] * Yi - becomeInf;
+      derivs[idx * 5 + 2] = becomeInf + immZ[idx] - g_eff[idx] * Zi - sigma_arr[idx] * Zi;
+
+      // Human SIRS dynamics
+      const foi = FOI[idx];
+      const newInfFromS = foi * Si;                // fully susceptible → infected
+      const newInfFromR = foi * alpha * Ri;        // immune reinfection (reduced rate)
+      const recovery = rEff[idx] * Ii;             // infected → immune
+      const immuneWaning = omega * Ri;             // immune → susceptible
+
+      derivs[idx * 5 + 3] = newInfFromS + newInfFromR - recovery;     // dI/dt
+      derivs[idx * 5 + 4] = recovery - immuneWaning - newInfFromR;    // dR/dt
     }
   }
 
-  return { rhs, ni, H: H.slice(0, ni), emergence: emergence.slice(0, ni), g0: g0.slice(0, ni) };
+  return { rhs, ni, nStates, H: H.slice(0, ni), emergence: emergence.slice(0, ni), g0: g0.slice(0, ni) };
 }
 
 // RK45 adaptive step (Dormand-Prince)
@@ -523,17 +570,21 @@ function solveODE(rhsFn, y0, tEnd, dt = 2.0) {
 function runSimulation(landscape, interventions, tMaxDays, initPrevByPatch, strategyConfig) {
   const ode = buildODE(landscape, interventions, strategyConfig);
   const ni = ode.ni;
-  const nStates = ni * 4;
+  const nStates = ode.nStates;  // ni * 5 now
 
-  // Initial conditions: per-patch prevalence with consistent mosquito state
+  // Initial conditions: per-patch prevalence with SIRS immune pool
   const y0 = new Float64Array(nStates);
   for (let idx = 0; idx < ni; idx++) {
     const M0 = ode.emergence[idx] / ode.g0[idx];
     const prev0 = (initPrevByPatch && initPrevByPatch[idx] != null) ? initPrevByPatch[idx] : 0.4;
-    y0[idx * 4] = M0;
-    y0[idx * 4 + 1] = 0.15 * M0;
-    y0[idx * 4 + 2] = 0.05 * M0;
-    y0[idx * 4 + 3] = prev0 * ode.H[idx];
+    // In an endemic equilibrium, a substantial fraction of non-infected people are immune
+    // Estimate: R0 ≈ (1 - prev0) * 0.5 * H (half of uninfected are semi-immune)
+    const R0 = (1 - prev0) * 0.5 * ode.H[idx];
+    y0[idx * 5] = M0;
+    y0[idx * 5 + 1] = 0.15 * M0;
+    y0[idx * 5 + 2] = 0.05 * M0;
+    y0[idx * 5 + 3] = prev0 * ode.H[idx];
+    y0[idx * 5 + 4] = R0;
   }
 
   const snapshots = solveODE(ode.rhs, y0, tMaxDays, 2.0);
@@ -542,7 +593,7 @@ function runSimulation(landscape, interventions, tMaxDays, initPrevByPatch, stra
   const times = snapshots.map(s => s.t / 365);
   const prevByPatch = [];
   for (let idx = 0; idx < ni; idx++) {
-    prevByPatch.push(snapshots.map(s => Math.max(0, Math.min(1, s.state[idx * 4 + 3] / ode.H[idx]))));
+    prevByPatch.push(snapshots.map(s => Math.max(0, Math.min(1, s.state[idx * 5 + 3] / ode.H[idx]))));
   }
   // Zone average (pop-weighted)
   const totalPop = ode.H.reduce((a, b) => a + b, 0);
@@ -1830,20 +1881,28 @@ export default function MalariaSimulator() {
 
             <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Transmission Dynamics</h3>
             <p style={{ margin: "0 0 12px" }}>
-              Within each patch, transmission follows an extended Ross-Macdonald framework solved as a system of ordinary differential equations (ODEs).
+              Within each patch, transmission follows an extended Ross-Macdonald framework with acquired immunity, solved as a system of ordinary differential equations (ODEs).
               The state variables for each patch are:
             </p>
             <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
               <strong>M</strong> — total adult female mosquito population<br/>
               <strong>Y</strong> — mosquitoes incubating (infected but not yet infectious)<br/>
               <strong>Z</strong> — infectious mosquitoes (sporozoite-positive)<br/>
-              <strong>I</strong> — infected humans (parasite-positive)
+              <strong>I</strong> — infected humans (parasite-positive)<br/>
+              <strong>R</strong> — semi-immune humans (recovered, with partial protection)
             </p>
             <p style={{ margin: "0 0 12px" }}>
               Mosquitoes emerge at a fixed rate per patch (representing local ecology), die at a natural death rate augmented by any insecticide-related
               mortality, and feed on humans with a given frequency. Upon feeding on an infectious human, a mosquito enters an incubation
-              period (EIP = 10 days), after which it becomes infectious for life. Humans become infected at a rate determined by the entomological
-              inoculation rate (EIR) and recover at a baseline rate that can be augmented by treatment.
+              period (EIP = 10 days), after which it becomes infectious for life.
+            </p>
+            <p style={{ margin: "0 0 12px" }}>
+              Human infection follows an SIRS (Susceptible → Infected → Recovered/Immune → Susceptible) model. Fully susceptible individuals (S = H − I − R) become infected
+              at a rate determined by the entomological inoculation rate (EIR). Upon recovery, individuals enter a semi-immune state (R) where they
+              have reduced susceptibility to reinfection (α = 0.38, meaning 62% less likely to become infected per bite) and, if reinfected, are less
+              infectious to mosquitoes (c reduced by 70%). Immunity wanes over approximately 1.5 years (ω = 1/540 per day) without boosting through
+              continued exposure. In high-transmission settings this produces a large immune pool that buffers against dramatic prevalence swings, while
+              in low-transmission settings immunity is weak and resurgence is faster after intervention withdrawal.
             </p>
 
             <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Spatial Coupling</h3>
@@ -1919,6 +1978,9 @@ export default function MalariaSimulator() {
               <span style={{ color: "var(--text-dim)" }}>IRS efficacy half-life</span><span>6 months</span>
               <span style={{ color: "var(--text-dim)" }}>Home time fraction</span><span>≥85%</span>
               <span style={{ color: "var(--text-dim)" }}>Gravity distance exponent</span><span>2.0</span>
+              <span style={{ color: "var(--text-dim)" }}>Immune susceptibility (α)</span><span>0.38 (62% reduction)</span>
+              <span style={{ color: "var(--text-dim)" }}>Immunity waning (ω)</span><span>1/540 per day (~1.5 yr)</span>
+              <span style={{ color: "var(--text-dim)" }}>Immune infectiousness</span><span>0.3× baseline</span>
             </div>
 
             <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Key Assumptions & Limitations</h3>
@@ -1926,9 +1988,10 @@ export default function MalariaSimulator() {
               This is a simplified model intended for strategic exploration, not operational forecasting. Important simplifications include:
             </p>
             <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
-              <strong>No immunity</strong> — The model does not track acquired immunity. In reality, people in high-transmission areas develop
-              partial immunity that reduces clinical severity and infectiousness. This means the model may overestimate prevalence in highly
-              endemic patches and underestimate resurgence speed after intervention withdrawal.
+              <strong>Simplified immunity</strong> — The model includes a single-compartment SIRS immunity model where recovered individuals
+              gain partial protection that wanes over ~1.5 years. This captures the key qualitative effects (buffered prevalence in endemic areas,
+              faster resurgence when immunity wanes during intervention periods) but does not track the full complexity of age-dependent, exposure-driven
+              immunity with clinical, anti-infection, and anti-parasite components as in models like malariasimulation.
             </p>
             <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
               <strong>No age structure</strong> — All humans are treated identically. In reality, children bear a disproportionate burden and
