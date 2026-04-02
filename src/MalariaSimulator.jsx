@@ -470,19 +470,20 @@ function solveODE(rhsFn, y0, tEnd, dt = 2.0) {
   return snapshots;
 }
 
-function runSimulation(landscape, interventions, tMaxDays) {
+function runSimulation(landscape, interventions, tMaxDays, initPrevByPatch) {
   const ode = buildODE(landscape, interventions);
   const ni = ode.ni;
   const nStates = ni * 4;
 
-  // Initial conditions: high-endemic equilibrium
+  // Initial conditions: per-patch prevalence with consistent mosquito state
   const y0 = new Float64Array(nStates);
   for (let idx = 0; idx < ni; idx++) {
     const M0 = ode.emergence[idx] / ode.g0[idx];
+    const prev0 = (initPrevByPatch && initPrevByPatch[idx] != null) ? initPrevByPatch[idx] : 0.4;
     y0[idx * 4] = M0;
     y0[idx * 4 + 1] = 0.15 * M0;
     y0[idx * 4 + 2] = 0.05 * M0;
-    y0[idx * 4 + 3] = 0.4 * ode.H[idx];
+    y0[idx * 4 + 3] = prev0 * ode.H[idx];
   }
 
   const snapshots = solveODE(ode.rhs, y0, tMaxDays, 2.0);
@@ -593,15 +594,28 @@ function makeTemplateInterventions(templateKey, landscape) {
       return [{ patchIndices: highTx, itnCov: 0.8, irsCov: 0, chw: false, improvedCure: 0 }];
     case "irs_universal":
       return [{ patchIndices: allInternal, itnCov: 0, irsCov: 0.8, chw: false, improvedCure: 0 }];
+    case "irs_targeted":
+      return [{ patchIndices: highTx, itnCov: 0, irsCov: 0.8, chw: false, improvedCure: 0 }];
     case "itn_irs_combo":
       return [
         { patchIndices: allInternal, itnCov: 0.8, irsCov: 0, chw: false, improvedCure: 0 },
         { patchIndices: highTx, itnCov: 0, irsCov: 0.8, chw: false, improvedCure: 0 },
       ];
+    case "chw_only":
+      return [{ patchIndices: lowAccess, itnCov: 0, irsCov: 0, chw: true, improvedCure: 0 }];
+    case "chw_cure":
+      return [
+        { patchIndices: lowAccess, itnCov: 0, irsCov: 0, chw: true, improvedCure: 0 },
+        { patchIndices: allInternal, itnCov: 0, irsCov: 0, chw: false, improvedCure: 0.95 },
+      ];
     case "itn_chw":
       return [
         { patchIndices: allInternal, itnCov: 0.8, irsCov: 0, chw: false, improvedCure: 0 },
         { patchIndices: lowAccess, itnCov: 0, irsCov: 0, chw: true, improvedCure: 0 },
+      ];
+    case "itn_cure":
+      return [
+        { patchIndices: allInternal, itnCov: 0.8, irsCov: 0, chw: false, improvedCure: 0.95 },
       ];
     case "full_package":
       return [
@@ -650,14 +664,57 @@ function perPatchToInterventions(perPatch) {
 // ============================================================================
 
 const TEMPLATES = [
-  { key: "none", label: "No intervention" },
-  { key: "itn_universal", label: "Universal ITN (80%)" },
-  { key: "itn_targeted", label: "Targeted ITN (high-Tx patches)" },
-  { key: "irs_universal", label: "Universal IRS (80%)" },
-  { key: "itn_irs_combo", label: "ITN everywhere + IRS (high-Tx)" },
-  { key: "itn_chw", label: "ITN + CHWs (low-access patches)" },
-  { key: "full_package", label: "Full package (ITN+IRS+CHW+Cure)" },
+  { key: "none", label: "No intervention", group: "Baseline" },
+  { key: "itn_universal", label: "Universal ITN (80%)", group: "Vector Control" },
+  { key: "itn_targeted", label: "Targeted ITN (high-Tx patches)", group: "Vector Control" },
+  { key: "irs_universal", label: "Universal IRS (80%)", group: "Vector Control" },
+  { key: "irs_targeted", label: "Targeted IRS (high-Tx patches)", group: "Vector Control" },
+  { key: "itn_irs_combo", label: "ITN everywhere + IRS (high-Tx)", group: "Vector Control" },
+  { key: "chw_only", label: "CHWs only (low-access patches)", group: "Case Management" },
+  { key: "chw_cure", label: "CHWs + improved cure rate", group: "Case Management" },
+  { key: "itn_chw", label: "ITN + CHWs (low-access patches)", group: "Combined" },
+  { key: "itn_cure", label: "ITN + improved cure rate", group: "Combined" },
+  { key: "full_package", label: "Full package (ITN+IRS+CHW+Cure)", group: "Combined" },
 ];
+
+// ============================================================================
+// INITIAL PREVALENCE DISTRIBUTION
+// ============================================================================
+
+function distributePrevalence(landscape, targetZoneAvg) {
+  // Distribute a target zone-average prevalence across patches proportionally
+  // to each patch's transmission intensity (M/P ratio). This produces realistic
+  // heterogeneity: swamp patches start high, hill villages start low.
+  //
+  // Method: weight_i = (M/P)_i ^ 0.6  (sublinear to avoid extremes)
+  // Then scale so pop-weighted average = targetZoneAvg, clamped to [0.01, 0.90].
+  const ni = landscape.nInt;
+  const patches = landscape.patches;
+  const mu = BIONOMICS.mu;
+
+  const weights = [];
+  let totalPop = 0;
+  for (let i = 0; i < ni; i++) {
+    const mp = (patches[i].emergence / mu) / patches[i].population;
+    weights.push(Math.pow(Math.max(mp, 0.1), 0.6));
+    totalPop += patches[i].population;
+  }
+
+  // Compute weighted average of weights (pop-weighted)
+  let weightedAvg = 0;
+  for (let i = 0; i < ni; i++) weightedAvg += weights[i] * patches[i].population;
+  weightedAvg /= totalPop;
+
+  // Scale factor: each patch gets prev_i = targetZoneAvg * (weight_i / weightedAvg)
+  const prevs = [];
+  for (let i = 0; i < ni; i++) {
+    let p = targetZoneAvg * (weights[i] / weightedAvg);
+    p = Math.max(0.01, Math.min(0.90, p));
+    prevs.push(Math.round(p * 1000) / 1000); // round to 0.1%
+  }
+
+  return prevs;
+}
 
 // ============================================================================
 // STRATEGY COLORS
@@ -773,9 +830,13 @@ export default function MalariaSimulator() {
   const [counts, setCounts] = useState({ swamp: 3, lakeside: 4, inland: 5, market_town: 2, hill_village: 3 });
   const [importPrev, setImportPrev] = useState(0.45);
   const [tMaxYears, setTMaxYears] = useState(5);
+  const [targetPrev, setTargetPrev] = useState(0.35);
 
   // Landscape
   const [landscape, setLandscape] = useState(null);
+
+  // Per-patch initial prevalence (set when landscape is generated, editable)
+  const [initPrevByPatch, setInitPrevByPatch] = useState(null);
 
   // Strategies (up to 3)
   const [strategies, setStrategies] = useState([
@@ -792,6 +853,7 @@ export default function MalariaSimulator() {
   const [selectedPatch, setSelectedPatch] = useState(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [activeTab, setActiveTab] = useState("landscape"); // landscape | strategies | results
+  const [showAddModal, setShowAddModal] = useState(false);
 
   const totalPatches = Object.values(counts).reduce((a, b) => a + b, 0);
 
@@ -802,13 +864,18 @@ export default function MalariaSimulator() {
     setLandscape(ls);
     setResults(null);
     setSelectedPatch(null);
+
+    // Distribute starting prevalence across patches by M/P ratio
+    const initPrev = distributePrevalence(ls, targetPrev);
+    setInitPrevByPatch(initPrev);
+
     // Reset strategy per-patch overrides
     setStrategies(prev => prev.map(s => {
       const ivs = makeTemplateInterventions(s.template, ls);
       return { ...s, perPatch: mergeInterventions(ivs, ls.nInt) };
     }));
     setActiveTab("strategies");
-  }, [seed, counts, importPrev]);
+  }, [seed, counts, importPrev, targetPrev]);
 
   // Update strategy template
   const setTemplate = useCallback((idx, templateKey) => {
@@ -832,17 +899,28 @@ export default function MalariaSimulator() {
     setResults(null);
   }, []);
 
-  // Add/remove strategy
-  const addStrategy = () => {
+  // Add/remove/rename strategy
+  const addStrategy = (templateKey) => {
     if (strategies.length >= 3 || !landscape) return;
-    const ivs = makeTemplateInterventions("itn_chw", landscape);
-    setStrategies(prev => [...prev, { template: "itn_chw", perPatch: mergeInterventions(ivs, landscape.nInt), label: "ITN + CHW" }]);
+    const tmpl = TEMPLATES.find(t => t.key === templateKey) || TEMPLATES[0];
+    const ivs = makeTemplateInterventions(templateKey, landscape);
+    setStrategies(prev => [...prev, { template: templateKey, perPatch: mergeInterventions(ivs, landscape.nInt), label: tmpl.label }]);
+    setActiveStrategy(strategies.length); // select the new one
+    setShowAddModal(false);
+    setResults(null);
   };
   const removeStrategy = (idx) => {
     if (strategies.length <= 1) return;
     setStrategies(prev => prev.filter((_, i) => i !== idx));
     if (activeStrategy >= strategies.length - 1) setActiveStrategy(Math.max(0, strategies.length - 2));
     setResults(null);
+  };
+  const renameStrategy = (idx, newLabel) => {
+    setStrategies(prev => {
+      const next = [...prev];
+      next[idx] = { ...next[idx], label: newLabel };
+      return next;
+    });
   };
 
   // Run simulation
@@ -856,14 +934,14 @@ export default function MalariaSimulator() {
       const tMax = tMaxYears * 365;
       const allResults = strategies.map(s => {
         const ivs = perPatchToInterventions(s.perPatch || []);
-        const simRes = runSimulation(landscape, ivs, tMax);
+        const simRes = runSimulation(landscape, ivs, tMax, initPrevByPatch);
         const costs = computeCosts(landscape, ivs);
         return { ...simRes, costs, label: s.label };
       });
       setResults(allResults);
       setSimRunning(false);
     }, 50);
-  }, [landscape, strategies, tMaxYears]);
+  }, [landscape, strategies, tMaxYears, initPrevByPatch]);
 
   // Count label
   const setCount = (key, val) => {
@@ -945,6 +1023,17 @@ export default function MalariaSimulator() {
                   <span style={{ fontSize: 13, width: 36, textAlign: "right" }}>{(importPrev * 100).toFixed(0)}%</span>
                 </div>
               </label>
+              <label style={{ fontSize: 12 }}>
+                <span style={{ color: "var(--text-dim)" }}>Starting prevalence (zone average)</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+                  <input type="range" min={5} max={70} step={5} value={targetPrev * 100}
+                    onChange={e => setTargetPrev(+e.target.value / 100)} style={{ flex: 1 }} />
+                  <span style={{ fontSize: 13, width: 36, textAlign: "right" }}>{(targetPrev * 100).toFixed(0)}%</span>
+                </div>
+                <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 2 }}>
+                  Distributed across patches by transmission intensity
+                </div>
+              </label>
             </div>
 
             <div style={{ marginTop: 16 }}>
@@ -1018,14 +1107,71 @@ export default function MalariaSimulator() {
                   </button>
                 ))}
                 {strategies.length < 3 && (
-                  <button onClick={addStrategy}
+                  <button onClick={() => setShowAddModal(true)}
                     style={{ padding: "6px 12px", fontSize: 12, borderRadius: 6, border: "1px dashed var(--border)", background: "transparent", color: "var(--text-dim)", cursor: "pointer" }}>
                     + Add Strategy
                   </button>
                 )}
               </div>
 
+              {/* Add Strategy Modal */}
+              {showAddModal && (
+                <div style={{
+                  position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+                  background: "rgba(0,0,0,0.6)", zIndex: 1000,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                }} onClick={() => setShowAddModal(false)}>
+                  <div style={{
+                    background: "var(--bg2)", border: "1px solid var(--border)", borderRadius: 12,
+                    padding: 24, width: 420, maxWidth: "90vw", maxHeight: "80vh", overflowY: "auto",
+                  }} onClick={e => e.stopPropagation()}>
+                    <h3 style={{ margin: "0 0 16px", fontSize: 16, fontWeight: 700 }}>Add Strategy</h3>
+                    <div style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 12 }}>
+                      Choose a starting template. You can customize every patch after adding.
+                    </div>
+                    {["Baseline", "Vector Control", "Case Management", "Combined"].map(group => {
+                      const items = TEMPLATES.filter(t => t.group === group);
+                      if (items.length === 0) return null;
+                      return (
+                        <div key={group} style={{ marginBottom: 12 }}>
+                          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-dim)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
+                            {group}
+                          </div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                            {items.map(t => (
+                              <button key={t.key} onClick={() => addStrategy(t.key)}
+                                style={{
+                                  padding: "8px 12px", fontSize: 12, textAlign: "left",
+                                  background: "var(--bg3)", border: "1px solid var(--border)", borderRadius: 6,
+                                  color: "var(--text)", cursor: "pointer",
+                                  transition: "border-color 0.15s",
+                                }}
+                                onMouseOver={e => e.currentTarget.style.borderColor = "var(--accent)"}
+                                onMouseOut={e => e.currentTarget.style.borderColor = "var(--border)"}>
+                                {t.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <button onClick={() => setShowAddModal(false)}
+                      style={{ marginTop: 8, padding: "6px 16px", fontSize: 12, background: "transparent", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-dim)", cursor: "pointer" }}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div style={{ background: "var(--bg2)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
+                {/* Editable strategy name */}
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 4 }}>Strategy name</div>
+                  <input type="text" value={strategies[activeStrategy]?.label || ""}
+                    onChange={e => renameStrategy(activeStrategy, e.target.value)}
+                    style={{ width: "100%", padding: "6px 10px", background: "var(--bg3)", border: "1px solid var(--border)", borderRadius: 6, color: STRATEGY_COLORS[activeStrategy], fontSize: 13, fontWeight: 600 }} />
+                </div>
+
                 <div style={{ marginBottom: 12 }}>
                   <div style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 4 }}>Template</div>
                   <select value={strategies[activeStrategy]?.template || "none"}
@@ -1047,6 +1193,7 @@ export default function MalariaSimulator() {
                       <thead>
                         <tr style={{ color: "var(--text-dim)", borderBottom: "1px solid var(--border)" }}>
                           <th style={{ textAlign: "left", padding: "4px 6px", fontWeight: 600 }}>Patch</th>
+                          <th style={{ textAlign: "center", padding: "4px 4px", fontWeight: 600 }}>Init %</th>
                           <th style={{ textAlign: "center", padding: "4px 4px", fontWeight: 600 }}>ITN</th>
                           <th style={{ textAlign: "center", padding: "4px 4px", fontWeight: 600 }}>IRS</th>
                           <th style={{ textAlign: "center", padding: "4px 4px", fontWeight: 600 }}>CHW</th>
@@ -1056,6 +1203,7 @@ export default function MalariaSimulator() {
                       <tbody>
                         {strategies[activeStrategy].perPatch.map((pp, i) => {
                           const p = landscape.patches[i];
+                          const iPrev = initPrevByPatch ? initPrevByPatch[i] : 0.4;
                           return (
                             <tr key={i} onClick={() => setSelectedPatch(i)}
                               style={{
@@ -1066,6 +1214,18 @@ export default function MalariaSimulator() {
                               <td style={{ padding: "4px 6px" }}>
                                 <span style={{ width: 6, height: 6, borderRadius: "50%", background: p.color, display: "inline-block", marginRight: 4 }} />
                                 {p.name.replace("Settlement ", "S").replace("Village ", "V").replace("Town ", "T")}
+                              </td>
+                              <td style={{ textAlign: "center", padding: "4px 4px" }}>
+                                <input type="number" min={1} max={90} step={1}
+                                  value={Math.round(iPrev * 100)}
+                                  onChange={e => {
+                                    const v = Math.max(1, Math.min(90, +e.target.value)) / 100;
+                                    const next = [...initPrevByPatch];
+                                    next[i] = Math.round(v * 1000) / 1000;
+                                    setInitPrevByPatch(next);
+                                    setResults(null);
+                                  }}
+                                  style={{ width: 40, fontSize: 10, background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text-dim)", borderRadius: 3, padding: "1px 2px", textAlign: "center" }} />
                               </td>
                               <td style={{ textAlign: "center", padding: "4px 4px" }}>
                                 <select value={pp.itnCov} onChange={e => {
