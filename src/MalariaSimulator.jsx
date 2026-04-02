@@ -1059,6 +1059,46 @@ export default function MalariaSimulator() {
 
   const currentStratPerPatch = strategies[activeStrategy]?.perPatch;
 
+  // Update a single patch property in the landscape and recompute derived state
+  const updatePatch = useCallback((patchIdx, field, value) => {
+    if (!landscape) return;
+    setLandscape(prev => {
+      // Deep-clone enough to be safe
+      const newPatches = prev.patches.map((p, i) => i === patchIdx ? { ...p } : p);
+      const newLandscape = { ...prev, patches: newPatches, Theta: new Float64Array(prev.Theta), K: new Float64Array(prev.K) };
+
+      if (field === "population") {
+        newLandscape.patches[patchIdx].population = Math.max(50, Math.round(value / 50) * 50);
+      } else if (field === "emergence") {
+        newLandscape.patches[patchIdx].emergence = Math.max(5, value);
+      } else if (field === "access") {
+        newLandscape.patches[patchIdx].access = Math.max(0, Math.min(1, value));
+      } else if (field === "isBorder") {
+        const p = newLandscape.patches[patchIdx];
+        const nT = newLandscape.nTotal;
+        const extIdx = nT - 1;
+        if (value && !p.isBorder) {
+          // Make border: add 8% external time
+          const extTime = 0.08;
+          newLandscape.Theta[extIdx * nT + patchIdx] = extTime;
+          newLandscape.Theta[patchIdx * nT + patchIdx] = Math.max(0.5, newLandscape.Theta[patchIdx * nT + patchIdx] - extTime);
+        } else if (!value && p.isBorder) {
+          // Remove border: return external time to home
+          const oldExt = newLandscape.Theta[extIdx * nT + patchIdx];
+          newLandscape.Theta[patchIdx * nT + patchIdx] += oldExt;
+          newLandscape.Theta[extIdx * nT + patchIdx] = 0;
+        }
+        // Re-normalize column
+        let s = 0;
+        for (let i = 0; i < nT; i++) s += newLandscape.Theta[i * nT + patchIdx];
+        if (s > 0) for (let i = 0; i < nT; i++) newLandscape.Theta[i * nT + patchIdx] /= s;
+        newLandscape.patches[patchIdx].isBorder = value;
+      }
+      return newLandscape;
+    });
+    setResults(null);
+  }, [landscape]);
+
   return (
     <div style={{
       fontFamily: "'Source Sans 3', 'Source Sans Pro', 'Segoe UI', system-ui, sans-serif",
@@ -1086,18 +1126,18 @@ export default function MalariaSimulator() {
         </div>
         <div style={{ flex: 1 }} />
         <div style={{ display: "flex", gap: 2, background: "var(--bg3)", borderRadius: 8, padding: 2 }}>
-          {["landscape", "strategies", "results"].map(tab => (
+          {["landscape", "strategies", "results", "about"].map(tab => (
             <button key={tab} onClick={() => setActiveTab(tab)}
-              disabled={tab === "strategies" && !landscape}
+              disabled={(tab === "strategies" || tab === "results") && !landscape}
               style={{
                 padding: "7px 16px", fontSize: 12, fontWeight: 600, borderRadius: 6,
-                border: "none", cursor: tab === "strategies" && !landscape ? "not-allowed" : "pointer",
+                border: "none", cursor: ((tab === "strategies" || tab === "results") && !landscape) ? "not-allowed" : "pointer",
                 background: activeTab === tab ? "var(--accent)" : "transparent",
                 color: activeTab === tab ? "#000" : "var(--text-dim)",
-                opacity: tab === "strategies" && !landscape ? 0.4 : 1,
+                opacity: ((tab === "strategies" || tab === "results") && !landscape) ? 0.4 : 1,
                 transition: "all 0.15s",
               }}>
-              {tab === "landscape" ? "1. Landscape" : tab === "strategies" ? "2. Strategies" : "3. Results"}
+              {tab === "landscape" ? "1. Landscape" : tab === "strategies" ? "2. Strategies" : tab === "results" ? "3. Results" : "About"}
             </button>
           ))}
         </div>
@@ -1178,10 +1218,110 @@ export default function MalariaSimulator() {
 
             {landscape && (
               <div style={{ marginTop: 20 }}>
-                <div style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 8 }}>
-                  Preview — {landscape.nInt} patches, {landscape.patches.slice(0, landscape.nInt).reduce((s, p) => s + p.population, 0).toLocaleString()} total pop
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                  <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
+                    Preview — {landscape.nInt} patches, {landscape.patches.slice(0, landscape.nInt).reduce((s, p) => s + p.population, 0).toLocaleString()} total pop
+                  </div>
+                  <div style={{ display: "flex", gap: 2, background: "var(--bg3)", borderRadius: 5, padding: 1 }}>
+                    {[["archetype", "Type"], ["prevalence", "Baseline PR"]].map(([mode, label]) => (
+                      <button key={mode} onClick={() => setMapColorMode(mode)}
+                        style={{
+                          padding: "3px 8px", fontSize: 10, fontWeight: 600, borderRadius: 4,
+                          border: "none", cursor: "pointer",
+                          background: mapColorMode === mode ? "var(--accent)" : "transparent",
+                          color: mapColorMode === mode ? "#000" : "var(--text-dim)",
+                        }}>{label}</button>
+                    ))}
+                  </div>
                 </div>
-                <LandscapeMap landscape={landscape} width={Math.min(500, 460)} height={300} />
+                <LandscapeMap landscape={landscape}
+                  prevalenceValues={initPrevByPatch}
+                  colorMode={mapColorMode}
+                  width={Math.min(500, 460)} height={300} />
+              </div>
+            )}
+
+            {/* Patch characteristics table */}
+            {landscape && initPrevByPatch && (
+              <div style={{ marginTop: 16 }}>
+                <h3 style={{ margin: "0 0 8px", fontSize: 14, fontWeight: 700 }}>Patch Characteristics</h3>
+                <div style={{ maxHeight: 340, overflowY: "auto" }}>
+                  <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr style={{ color: "var(--text-dim)", borderBottom: "1px solid var(--border)", position: "sticky", top: 0, background: "var(--bg2)" }}>
+                        <th style={{ textAlign: "left", padding: "4px 6px", fontWeight: 600 }}>Patch</th>
+                        <th style={{ textAlign: "right", padding: "4px 6px", fontWeight: 600 }}>Pop</th>
+                        <th style={{ textAlign: "right", padding: "4px 6px", fontWeight: 600 }}>Mosq/day</th>
+                        <th style={{ textAlign: "right", padding: "4px 6px", fontWeight: 600 }}>M:P</th>
+                        <th style={{ textAlign: "right", padding: "4px 6px", fontWeight: 600 }}>Access</th>
+                        <th style={{ textAlign: "right", padding: "4px 6px", fontWeight: 600 }}>Time home</th>
+                        <th style={{ textAlign: "center", padding: "4px 6px", fontWeight: 600 }}>Border</th>
+                        <th style={{ textAlign: "center", padding: "4px 6px", fontWeight: 600 }}>Baseline PR</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {landscape.patches.slice(0, landscape.nInt).map((p, i) => {
+                        const mp = (p.emergence / BIONOMICS.mu) / p.population;
+                        const n_total = landscape.nTotal;
+                        const timeHome = landscape.Theta[i * n_total + i];
+                        const cellInputStyle = { width: 52, fontSize: 10, background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 3, padding: "2px 4px", textAlign: "right" };
+                        return (
+                          <tr key={i} style={{ borderBottom: "1px solid var(--border)" }}>
+                            <td style={{ padding: "4px 6px" }}>
+                              <span style={{ width: 6, height: 6, borderRadius: "50%", background: p.color, display: "inline-block", marginRight: 4 }} />
+                              {p.name}
+                            </td>
+                            <td style={{ textAlign: "right", padding: "4px 4px" }}>
+                              <input type="number" min={50} max={50000} step={50}
+                                value={p.population}
+                                onChange={e => updatePatch(i, "population", +e.target.value)}
+                                style={cellInputStyle} />
+                            </td>
+                            <td style={{ textAlign: "right", padding: "4px 4px" }}>
+                              <input type="number" min={5} max={5000} step={10}
+                                value={Math.round(p.emergence)}
+                                onChange={e => updatePatch(i, "emergence", +e.target.value)}
+                                style={cellInputStyle} />
+                            </td>
+                            <td style={{ textAlign: "right", padding: "4px 6px", fontWeight: 600, color: mp > 5 ? "var(--danger)" : mp > 2 ? "#e8781a" : "var(--text)" }}>
+                              {mp.toFixed(1)}
+                            </td>
+                            <td style={{ textAlign: "right", padding: "4px 4px" }}>
+                              <input type="number" min={0} max={100} step={5}
+                                value={Math.round(p.access * 100)}
+                                onChange={e => updatePatch(i, "access", Math.max(0, Math.min(100, +e.target.value)) / 100)}
+                                style={{ ...cellInputStyle, width: 40 }} />
+                              <span style={{ fontSize: 9, color: "var(--text-dim)" }}>%</span>
+                            </td>
+                            <td style={{ textAlign: "right", padding: "4px 6px", color: "var(--text-dim)" }}>
+                              {(timeHome * 100).toFixed(0)}%
+                            </td>
+                            <td style={{ textAlign: "center", padding: "4px 6px" }}>
+                              <input type="checkbox" checked={!!p.isBorder}
+                                onChange={e => updatePatch(i, "isBorder", e.target.checked)} />
+                            </td>
+                            <td style={{ textAlign: "center", padding: "4px 4px" }}>
+                              <input type="number" min={1} max={90} step={1}
+                                value={Math.round(initPrevByPatch[i] * 100)}
+                                onChange={e => {
+                                  const v = Math.max(1, Math.min(90, +e.target.value)) / 100;
+                                  const next = [...initPrevByPatch];
+                                  next[i] = Math.round(v * 1000) / 1000;
+                                  setInitPrevByPatch(next);
+                                  setResults(null);
+                                }}
+                                style={{ ...cellInputStyle, width: 40, textAlign: "center" }} />
+                              <span style={{ fontSize: 9, color: "var(--text-dim)" }}>%</span>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 6 }}>
+                  All values are editable. Pop = population (rounded to nearest 50). Mosq/day = daily mosquito emergence. M:P = equilibrium mosquitoes per person (computed). Access = fraction who can reach a health facility. Time home = fraction of time residents spend in own patch (from gravity model). Border = connected to external high-prevalence region. Baseline PR = starting parasite rate.
+                </div>
               </div>
             )}
           </div>
@@ -1359,7 +1499,6 @@ export default function MalariaSimulator() {
                       <thead>
                         <tr style={{ color: "var(--text-dim)", borderBottom: "1px solid var(--border)" }}>
                           <th style={{ textAlign: "left", padding: "4px 6px", fontWeight: 600 }}>Patch</th>
-                          <th style={{ textAlign: "center", padding: "4px 4px", fontWeight: 600 }}>Init %</th>
                           <th style={{ textAlign: "center", padding: "4px 4px", fontWeight: 600 }}>ITN</th>
                           <th style={{ textAlign: "center", padding: "4px 4px", fontWeight: 600 }}>IRS</th>
                           <th style={{ textAlign: "center", padding: "4px 4px", fontWeight: 600 }}>CHW</th>
@@ -1369,7 +1508,6 @@ export default function MalariaSimulator() {
                       <tbody>
                         {strategies[activeStrategy].perPatch.map((pp, i) => {
                           const p = landscape.patches[i];
-                          const iPrev = initPrevByPatch ? initPrevByPatch[i] : 0.4;
                           return (
                             <tr key={i} onClick={() => setSelectedPatch(i)}
                               style={{
@@ -1380,18 +1518,6 @@ export default function MalariaSimulator() {
                               <td style={{ padding: "4px 6px" }}>
                                 <span style={{ width: 6, height: 6, borderRadius: "50%", background: p.color, display: "inline-block", marginRight: 4 }} />
                                 {p.name.replace("Settlement ", "S").replace("Village ", "V").replace("Town ", "T")}
-                              </td>
-                              <td style={{ textAlign: "center", padding: "4px 4px" }}>
-                                <input type="number" min={1} max={90} step={1}
-                                  value={Math.round(iPrev * 100)}
-                                  onChange={e => {
-                                    const v = Math.max(1, Math.min(90, +e.target.value)) / 100;
-                                    const next = [...initPrevByPatch];
-                                    next[i] = Math.round(v * 1000) / 1000;
-                                    setInitPrevByPatch(next);
-                                    setResults(null);
-                                  }}
-                                  style={{ width: 40, fontSize: 10, background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text-dim)", borderRadius: 3, padding: "1px 2px", textAlign: "center" }} />
                               </td>
                               <td style={{ textAlign: "center", padding: "4px 4px" }}>
                                 <select value={pp.itnCov} onChange={e => {
@@ -1685,6 +1811,150 @@ export default function MalariaSimulator() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ABOUT TAB */}
+      {activeTab === "about" && (
+        <div style={{ padding: "20px 24px", maxWidth: 800, margin: "0 auto" }}>
+          <div style={{ background: "var(--bg2)", border: "1px solid var(--border)", borderRadius: 10, padding: 24, fontSize: 13, lineHeight: 1.7, color: "var(--text)" }}>
+            <h2 style={{ margin: "0 0 16px", fontSize: 18, fontWeight: 700 }}>About This Model</h2>
+
+            <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Overview</h3>
+            <p style={{ margin: "0 0 12px" }}>
+              This is a deterministic, compartmental spatial malaria transmission model. It simulates <em>Plasmodium falciparum</em> malaria
+              across a landscape of interconnected patches (villages, towns, settlements), each with distinct ecology, population, health system
+              access, and mosquito density. The model is designed to explore how different intervention strategies — and their spatial targeting —
+              affect malaria prevalence, costs, and resurgence risk.
+            </p>
+
+            <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Transmission Dynamics</h3>
+            <p style={{ margin: "0 0 12px" }}>
+              Within each patch, transmission follows an extended Ross-Macdonald framework solved as a system of ordinary differential equations (ODEs).
+              The state variables for each patch are:
+            </p>
+            <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
+              <strong>M</strong> — total adult female mosquito population<br/>
+              <strong>Y</strong> — mosquitoes incubating (infected but not yet infectious)<br/>
+              <strong>Z</strong> — infectious mosquitoes (sporozoite-positive)<br/>
+              <strong>I</strong> — infected humans (parasite-positive)
+            </p>
+            <p style={{ margin: "0 0 12px" }}>
+              Mosquitoes emerge at a fixed rate per patch (representing local ecology), die at a natural death rate augmented by any insecticide-related
+              mortality, and feed on humans with a given frequency. Upon feeding on an infectious human, a mosquito enters an incubation
+              period (EIP = 10 days), after which it becomes infectious for life. Humans become infected at a rate determined by the entomological
+              inoculation rate (EIR) and recover at a baseline rate that can be augmented by treatment.
+            </p>
+
+            <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Spatial Coupling</h3>
+            <p style={{ margin: "0 0 12px" }}>
+              Patches are coupled through two mechanisms:
+            </p>
+            <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
+              <strong>Human movement</strong> — People divide their time across patches according to a gravity model. The movement matrix Θ defines
+              the fraction of time residents of patch j spend in patch i. Attractiveness is proportional to population (with a 1.5× bonus for market towns)
+              and decays with distance (exponent = 2). Residents spend at least 85% of their time at home. Border patches additionally have residents
+              spending time in the external region (high-prevalence surroundings), creating importation pressure.
+            </p>
+            <p style={{ margin: "0 0 12px", paddingLeft: 16 }}>
+              <strong>Mosquito dispersal</strong> — Adult mosquitoes emigrate between nearby patches at a rate proportional to half their death rate (σ = g/2).
+              Dispersal probability decays exponentially with distance (characteristic scale ~1.5 km). This means high-emergence patches "export"
+              mosquitoes to neighbors.
+            </p>
+
+            <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Intervention Models</h3>
+            <p style={{ margin: "0 0 8px" }}>
+              <strong>Insecticide-Treated Nets (ITNs)</strong> — Modeled using the Le Menach feeding cycle framework. When a mosquito attempts
+              to feed on a net user, it encounters the net with probability φ = 0.85 (accounting for outdoor/early biting). Given encounter,
+              the mosquito is killed with probability d = 0.41, repelled with probability r = 0.56, or successfully feeds with probability s = 0.03.
+              This model assumes dual active ingredient nets (e.g., Interceptor G2). After each mass campaign, insecticidal effectiveness decays
+              exponentially (half-life ~2.5 years) and physical net retention also decays (half-life ~4 years), producing realistic sawtooth
+              dynamics between campaigns.
+            </p>
+            <p style={{ margin: "0 0 8px" }}>
+              <strong>Indoor Residual Spraying (IRS)</strong> — Mosquitoes that successfully feed (including those that passed through ITN protection)
+              encounter sprayed walls with probability equal to IRS coverage. Wall-kill probability is 0.60 (calibrated to Actellic 300CS).
+              Efficacy decays exponentially with a half-life of ~6 months between spray rounds.
+            </p>
+            <p style={{ margin: "0 0 8px" }}>
+              <strong>Community Health Workers (CHWs)</strong> — Deploying CHWs in a patch extends effective health facility access: people who
+              couldn't previously reach a facility now have access through the CHW (access_effective = access + 0.6 × (1 − access)).
+              This flows through the treatment cascade to increase the case management rate.
+            </p>
+            <p style={{ margin: "0 0 12px" }}>
+              <strong>Improved Cure Rate</strong> — Represents supply chain improvements, better diagnostics, and health worker training.
+              Increases the probability of successful treatment from the baseline 85% to 95%, which also slightly increases care-seeking
+              through a quality-of-care feedback effect.
+            </p>
+
+            <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Case Management Cascade</h3>
+            <p style={{ margin: "0 0 12px" }}>
+              The effective case management rate is computed mechanistically rather than set as an arbitrary parameter. It flows through a
+              treatment cascade: an infection must be symptomatic (varies by patch, ~20-40%), the patient must seek care (varies by access
+              and care-seeking behavior), and treatment must be successful (cure rate). The resulting rate is added to the natural
+              recovery rate: r_eff = r_natural + cm, where cm = (symptomatic × care-seeking × access × cure_rate) / acute_duration.
+            </p>
+
+            <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Landscape Generation</h3>
+            <p style={{ margin: "0 0 12px" }}>
+              Landscapes are procedurally generated from five patch archetypes: <strong>swamp settlements</strong> (high mosquito density,
+              low access), <strong>lakeside villages</strong> (moderate-high density), <strong>inland villages</strong> (moderate),
+              <strong>market towns</strong> (lower density, high access, attract movement), and <strong>hill villages</strong> (low density,
+              low access, remote). Each archetype has characteristic distributions for population, mosquito emergence, health facility access,
+              remoteness, and symptomatic fraction. Patches are placed spatially and connected via the gravity and dispersal models described above.
+            </p>
+
+            <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Key Parameters</h3>
+            <div style={{ fontSize: 11, display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 20px", padding: "8px 0" }}>
+              <span style={{ color: "var(--text-dim)" }}>Mosquito death rate (μ)</span><span>0.1/day (10-day lifespan)</span>
+              <span style={{ color: "var(--text-dim)" }}>Feeding rate (f)</span><span>1/3 per day (3-day gonotrophic cycle)</span>
+              <span style={{ color: "var(--text-dim)" }}>Human blood index (q)</span><span>0.9</span>
+              <span style={{ color: "var(--text-dim)" }}>Extrinsic incubation (EIP)</span><span>10 days</span>
+              <span style={{ color: "var(--text-dim)" }}>Transmission efficiency (b)</span><span>0.55</span>
+              <span style={{ color: "var(--text-dim)" }}>Natural recovery rate (r)</span><span>1/200 per day (~7 months)</span>
+              <span style={{ color: "var(--text-dim)" }}>Human infectiousness (c)</span><span>0.05</span>
+              <span style={{ color: "var(--text-dim)" }}>ITN net encounter prob (φ)</span><span>0.85</span>
+              <span style={{ color: "var(--text-dim)" }}>ITN efficacy half-life</span><span>2.5 years (dual AI)</span>
+              <span style={{ color: "var(--text-dim)" }}>IRS wall-kill prob</span><span>0.60 (Actellic 300CS)</span>
+              <span style={{ color: "var(--text-dim)" }}>IRS efficacy half-life</span><span>6 months</span>
+              <span style={{ color: "var(--text-dim)" }}>Home time fraction</span><span>≥85%</span>
+              <span style={{ color: "var(--text-dim)" }}>Gravity distance exponent</span><span>2.0</span>
+            </div>
+
+            <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>Key Assumptions & Limitations</h3>
+            <p style={{ margin: "0 0 8px" }}>
+              This is a simplified model intended for strategic exploration, not operational forecasting. Important simplifications include:
+            </p>
+            <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
+              <strong>No immunity</strong> — The model does not track acquired immunity. In reality, people in high-transmission areas develop
+              partial immunity that reduces clinical severity and infectiousness. This means the model may overestimate prevalence in highly
+              endemic patches and underestimate resurgence speed after intervention withdrawal.
+            </p>
+            <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
+              <strong>No age structure</strong> — All humans are treated identically. In reality, children bear a disproportionate burden and
+              intervention targeting (e.g., SMC) is age-specific.
+            </p>
+            <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
+              <strong>No seasonality</strong> — Mosquito emergence is constant over time. Real transmission is highly seasonal in most settings,
+              which affects optimal timing of IRS and other interventions.
+            </p>
+            <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
+              <strong>Deterministic</strong> — The ODE formulation captures average behavior, not stochastic effects. Near elimination, stochastic
+              fade-out becomes important and this model will underestimate the probability of local extinction.
+            </p>
+            <p style={{ margin: "0 0 6px", paddingLeft: 16 }}>
+              <strong>Simplified costing</strong> — Costs are rough estimates using flat per-person-year rates scaled by remoteness. They do not
+              capture economies of scale, procurement variation, or detailed delivery logistics.
+            </p>
+
+            <h3 style={{ margin: "20px 0 8px", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>References</h3>
+            <p style={{ margin: "0 0 6px", fontSize: 11, color: "var(--text-dim)" }}>
+              Wu SL et al. (2023) "Spatial dynamics of malaria transmission." <em>PLoS Computational Biology</em> 19(6): e1010684.<br/>
+              Le Menach A et al. (2007) "An elaborated feeding cycle model for reductions in vectorial capacity of night-biting mosquitoes by insecticide-treated nets." <em>Malaria Journal</em> 6:10.<br/>
+              Churcher TS et al. (2016) "The impact of pyrethroid resistance on the efficacy and effectiveness of bednets for malaria control in Africa." <em>eLife</em> 5:e16090.<br/>
+              Sherrard-Smith E et al. (2018) "Systematic review of indoor residual spray efficacy and effectiveness against Plasmodium falciparum in Africa." <em>Nature Communications</em> 9:4982.
+            </p>
+          </div>
         </div>
       )}
     </div>
