@@ -240,18 +240,32 @@ function generateLandscape(config) {
   Theta[extIdx * nTotal + extIdx] = 1.0;
 
   // Border patches spend time external
+  // External connectivity is driven by BOTH proximity to border AND attractiveness
+  // Market towns channel more cross-border movement due to commerce
   const borderY = borderThresh * mapH;
+  const maxAttract = Math.max(...attract);
   for (let j = 0; j < nInt; j++) {
     const yj = positions[j * 2 + 1];
+    // Proximity factor: patches in the lower portion of the map are closer to the border
+    // But we also allow non-border patches to have external connectivity if they're attractive enough
+    let proximityFactor = 0;
     if (yj <= borderY) {
-      const borderFrac = 1 - yj / borderY;
-      let extTime = extTimeBase * Math.pow(borderFrac, 2.0);
-      extTime = Math.min(extTime, 0.15);
-      if (extTime > 0.005) {
-        Theta[extIdx * nTotal + j] = extTime;
-        Theta[j * nTotal + j] -= extTime;
-        if (Theta[j * nTotal + j] < 0.5) Theta[j * nTotal + j] = 0.5;
-      }
+      proximityFactor = 1 - yj / borderY; // 1 at border, 0 at threshold
+    } else if (yj <= borderY * 1.8) {
+      // Market towns slightly above the border zone can still get some importation
+      proximityFactor = 0.3 * (1 - (yj - borderY) / (borderY * 0.8));
+    }
+    if (proximityFactor <= 0) continue;
+
+    // Attractiveness factor: larger/market-town patches channel more external movement
+    const attractFactor = 0.3 + 0.7 * (attract[j] / maxAttract); // range [0.3, 1.0]
+
+    let extTime = extTimeBase * Math.pow(proximityFactor, 1.5) * attractFactor;
+    extTime = Math.min(extTime, 0.15);
+    if (extTime > 0.005) {
+      Theta[extIdx * nTotal + j] = extTime;
+      Theta[j * nTotal + j] -= extTime;
+      if (Theta[j * nTotal + j] < 0.5) Theta[j * nTotal + j] = 0.5;
     }
   }
 
@@ -568,26 +582,34 @@ function solveODE(rhsFn, y0, tEnd, dt = 2.0) {
 }
 
 function runSimulation(landscape, interventions, tMaxDays, initPrevByPatch, strategyConfig) {
-  const ode = buildODE(landscape, interventions, strategyConfig);
-  const ni = ode.ni;
-  const nStates = ode.nStates;  // ni * 5 now
+  const ni = landscape.nInt;
 
-  // Initial conditions: per-patch prevalence with SIRS immune pool
+  // --- Phase 1: Burn-in with NO interventions to find SIRS equilibrium ---
+  // This prevents spurious prevalence decline at the start caused by
+  // initial S/I/R compartments being inconsistent with the true equilibrium.
+  const burnInDays = 730; // 2 years
+  const odeBaseline = buildODE(landscape, [], null); // no interventions
+  const nStates = odeBaseline.nStates;
+
   const y0 = new Float64Array(nStates);
   for (let idx = 0; idx < ni; idx++) {
-    const M0 = ode.emergence[idx] / ode.g0[idx];
+    const M0 = odeBaseline.emergence[idx] / odeBaseline.g0[idx];
     const prev0 = (initPrevByPatch && initPrevByPatch[idx] != null) ? initPrevByPatch[idx] : 0.4;
-    // In an endemic equilibrium, a substantial fraction of non-infected people are immune
-    // Estimate: R0 ≈ (1 - prev0) * 0.5 * H (half of uninfected are semi-immune)
-    const R0 = (1 - prev0) * 0.5 * ode.H[idx];
+    const R0 = (1 - prev0) * 0.5 * odeBaseline.H[idx];
     y0[idx * 5] = M0;
     y0[idx * 5 + 1] = 0.15 * M0;
     y0[idx * 5 + 2] = 0.05 * M0;
-    y0[idx * 5 + 3] = prev0 * ode.H[idx];
+    y0[idx * 5 + 3] = prev0 * odeBaseline.H[idx];
     y0[idx * 5 + 4] = R0;
   }
 
-  const snapshots = solveODE(ode.rhs, y0, tMaxDays, 2.0);
+  // Run burn-in (no snapshots needed, just get final state)
+  const burnInSnaps = solveODE(odeBaseline.rhs, y0, burnInDays, 4.0);
+  const equilibriumState = burnInSnaps[burnInSnaps.length - 1].state;
+
+  // --- Phase 2: Actual simulation with interventions from equilibrium ---
+  const ode = buildODE(landscape, interventions, strategyConfig);
+  const snapshots = solveODE(ode.rhs, equilibriumState, tMaxDays, 2.0);
 
   // Parse results
   const times = snapshots.map(s => s.t / 365);
