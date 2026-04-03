@@ -78,11 +78,11 @@ function matTVecMul(A, x) {
 // ============================================================================
 
 const ARCHETYPES = {
-  swamp: { label: "Swamp Settlement", popMean: 1000, popCv: 0.4, emergMean: 600, emergCv: 0.3, accessMean: 0.20, accessConc: 8, remoteMean: 1.8, symptMean: 0.20, symptConc: 15, careMean: 0.40, careConc: 12, xc: 0.3, yc: 0.15, spread: 0.12, attractBonus: 0, color: "#d95f02" },
-  lakeside: { label: "Lakeside Village", popMean: 2000, popCv: 0.3, emergMean: 400, emergCv: 0.3, accessMean: 0.40, accessConc: 10, remoteMean: 1.3, symptMean: 0.25, symptConc: 15, careMean: 0.50, careConc: 12, xc: 0.4, yc: 0.25, spread: 0.15, attractBonus: 0, color: "#1b9e77" },
-  inland: { label: "Inland Village", popMean: 3000, popCv: 0.35, emergMean: 200, emergCv: 0.35, accessMean: 0.50, accessConc: 10, remoteMean: 1.0, symptMean: 0.35, symptConc: 15, careMean: 0.50, careConc: 12, xc: 0.5, yc: 0.50, spread: 0.18, attractBonus: 0, color: "#7570b3" },
-  market_town: { label: "Market Town", popMean: 5000, popCv: 0.3, emergMean: 160, emergCv: 0.3, accessMean: 0.80, accessConc: 12, remoteMean: 0.7, symptMean: 0.40, symptConc: 15, careMean: 0.60, careConc: 12, xc: 0.5, yc: 0.45, spread: 0.20, attractBonus: 2000, color: "#e7298a" },
-  hill_village: { label: "Hill Village", popMean: 1500, popCv: 0.35, emergMean: 80, emergCv: 0.35, accessMean: 0.30, accessConc: 8, remoteMean: 2.0, symptMean: 0.35, symptConc: 15, careMean: 0.40, careConc: 12, xc: 0.6, yc: 0.80, spread: 0.15, attractBonus: 0, color: "#66a61e" },
+  swamp: { label: "Swamp Settlement", popMean: 500, popCv: 0.5, emergMean: 600, emergCv: 0.45, accessMean: 0.20, accessConc: 8, remoteMean: 1.8, symptMean: 0.20, symptConc: 15, careMean: 0.40, careConc: 12, xc: 0.3, yc: 0.15, spread: 0.12, attractBonus: 0, color: "#d95f02" },
+  lakeside: { label: "Lakeside Village", popMean: 1500, popCv: 0.45, emergMean: 400, emergCv: 0.45, accessMean: 0.40, accessConc: 10, remoteMean: 1.3, symptMean: 0.25, symptConc: 15, careMean: 0.50, careConc: 12, xc: 0.4, yc: 0.25, spread: 0.15, attractBonus: 0, color: "#1b9e77" },
+  inland: { label: "Inland Village", popMean: 3000, popCv: 0.45, emergMean: 200, emergCv: 0.45, accessMean: 0.50, accessConc: 10, remoteMean: 1.0, symptMean: 0.35, symptConc: 15, careMean: 0.50, careConc: 12, xc: 0.5, yc: 0.50, spread: 0.18, attractBonus: 0, color: "#7570b3" },
+  market_town: { label: "Market Town", popMean: 12000, popCv: 0.4, emergMean: 160, emergCv: 0.4, accessMean: 0.80, accessConc: 12, remoteMean: 0.7, symptMean: 0.40, symptConc: 15, careMean: 0.60, careConc: 12, xc: 0.5, yc: 0.45, spread: 0.20, attractBonus: 2000, color: "#e7298a" },
+  hill_village: { label: "Hill Village", popMean: 800, popCv: 0.5, emergMean: 80, emergCv: 0.5, accessMean: 0.30, accessConc: 8, remoteMean: 2.0, symptMean: 0.35, symptConc: 15, careMean: 0.40, careConc: 12, xc: 0.6, yc: 0.80, spread: 0.15, attractBonus: 0, color: "#66a61e" },
 };
 
 const ARCHETYPE_ORDER = ["swamp", "lakeside", "inland", "market_town", "hill_village"];
@@ -868,12 +868,19 @@ function LandscapeMap({ landscape, selectedPatch, onSelectPatch, strategyPerPatc
 
   return (
     <svg width={width} height={height} style={{ display: "block" }}>
+      {/* Arrow marker definition for border patches */}
+      <defs>
+        <marker id="importArrow" viewBox="0 0 6 6" refX="3" refY="3"
+          markerWidth={4} markerHeight={4} orient="auto-start-reverse">
+          <path d="M0,0 L6,3 L0,6 Z" fill="#f5a623" />
+        </marker>
+      </defs>
       {/* Title */}
       {title && <text x={width / 2} y={14} textAnchor="middle" fill="var(--text, #e8e6e3)" fontSize={11} fontWeight={700}>{title}</text>}
       {/* Border zone */}
       <rect x={ox} y={oy - cfg.borderThresh * mapH * scale} width={mapW * scale}
         height={cfg.borderThresh * mapH * scale}
-        fill="var(--border-zone, #f5e6d3)" opacity={0.3} rx={3} />
+        fill="var(--border-zone, #f5e6d3)" opacity={0.15} rx={3} />
       {!compact && <text x={ox + mapW * scale / 2} y={oy - 4} textAnchor="middle"
         fill="var(--text-dim, #999)" fontSize={9} fontStyle="italic">External border zone</text>}
       {/* Patches */}
@@ -890,19 +897,35 @@ function LandscapeMap({ landscape, selectedPatch, onSelectPatch, strategyPerPatc
           fillColor = prevColorScale(prevalenceValues[i]);
         }
 
+        // Arrow for border patches: small arrows pointing inward from below
+        const arrowLen = compact ? 8 : 14;
+
         return (
           <g key={i} onClick={() => onSelectPatch && onSelectPatch(i)} style={{ cursor: onSelectPatch ? "pointer" : "default" }}>
             {hasIntervention && !compact && <circle cx={cx} cy={cy} r={r + 4} fill="none" stroke="#000" strokeWidth={2} strokeDasharray="3,2" />}
             <circle cx={cx} cy={cy} r={r} fill={fillColor}
-              stroke={isSelected ? "#000" : p.isBorder ? "#555" : "#fff"}
-              strokeWidth={isSelected ? 3 : p.isBorder ? 2 : 1}
+              stroke={isSelected ? "#fff" : "rgba(255,255,255,0.3)"}
+              strokeWidth={isSelected ? 3 : 1}
               opacity={hasIntervention === false && strategyPerPatch && !usePrevColor ? 0.35 : 0.85} />
+            {/* Import arrows for border patches */}
+            {p.isBorder && !compact && (
+              <>
+                <line x1={cx - 5} y1={cy + r + 2} x2={cx - 5} y2={cy + r + 2 + arrowLen}
+                  stroke="#f5a623" strokeWidth={1.5} markerStart="url(#importArrow)" />
+                <line x1={cx + 5} y1={cy + r + 2} x2={cx + 5} y2={cy + r + 2 + arrowLen}
+                  stroke="#f5a623" strokeWidth={1.5} markerStart="url(#importArrow)" />
+              </>
+            )}
+            {p.isBorder && compact && (
+              <line x1={cx} y1={cy + r + 1} x2={cx} y2={cy + r + 1 + 6}
+                stroke="#f5a623" strokeWidth={1.5} markerStart="url(#importArrow)" />
+            )}
             {/* Prevalence label on patch */}
             {usePrevColor && <text x={cx} y={cy + 3} textAnchor="middle" fontSize={compact ? 6.5 : 8}
               fill="#fff" fontWeight={700} style={{ pointerEvents: "none", textShadow: "0 0 3px rgba(0,0,0,0.8)" }}>
               {(prevalenceValues[i] * 100).toFixed(0)}%
             </text>}
-            {!compact && <text x={cx} y={cy + r + 11} textAnchor="middle" fontSize={7.5}
+            {!compact && <text x={cx} y={cy + r + (p.isBorder ? arrowLen + 14 : 11)} textAnchor="middle" fontSize={7.5}
               fill="var(--text-main, #333)" fontWeight={isSelected ? 700 : 400}>
               {p.name.replace("Settlement ", "S").replace("Village ", "V").replace("Town ", "T")}
             </text>}
@@ -1028,7 +1051,7 @@ export default function MalariaSimulator() {
       const ivs = makeTemplateInterventions(s.template, ls);
       return { ...s, perPatch: mergeInterventions(ivs, ls.nInt), config: s.config || { itnStartYear: 0, itnCycleYears: 3, irsStartYear: 0, irsRoundsPerYear: 1 } };
     }));
-    setActiveTab("strategies");
+    setActiveTab("landscape");
   }, [seed, counts, importPrev, targetPrev]);
 
   // Update strategy template
